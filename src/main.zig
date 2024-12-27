@@ -4,7 +4,6 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
@@ -20,14 +19,20 @@ pub fn main() !void {
         var file = try std.fs.cwd().openFile(database_file_path, .{});
         defer file.close();
 
-        // You can use print statements as follows for debugging, they'll be visible when running tests.
-        std.debug.print("Logs from your program will appear here!\n", .{});
-
-        // Uncomment this block to pass the first stage
+        // read page size from file header
         var buf: [2]u8 = undefined;
         _ = try file.seekTo(16);
         _ = try file.read(&buf);
         const page_size = std.mem.readInt(u16, &buf, .big);
+
+        // read number of cells from page header
+        // page header starts at offset 100 for page 1
+        // number of cells is 2 bytes at offset 3 in page header
+        _ = try file.seekTo(100 + 3);
+        _ = try file.read(&buf);
+        const num_cells = std.mem.readInt(u16, &buf, .big);
+
         try std.io.getStdOut().writer().print("database page size: {}\n", .{page_size});
+        try std.io.getStdOut().writer().print("number of tables: {}\n", .{num_cells});
     }
 }
