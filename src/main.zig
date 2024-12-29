@@ -1,9 +1,12 @@
 const std = @import("std");
+const sqlite = @import("sqlite.zig");
+const Page = sqlite.Page;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
@@ -15,24 +18,28 @@ pub fn main() !void {
     const database_file_path: []const u8 = args[1];
     const command: []const u8 = args[2];
 
-    if (std.mem.eql(u8, command, ".dbinfo")) {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    if (std.mem.eql(u8, command, ".tables")) {
         var file = try std.fs.cwd().openFile(database_file_path, .{});
         defer file.close();
 
-        // read page size from file header
-        var buf: [2]u8 = undefined;
-        _ = try file.seekTo(16);
-        _ = try file.read(&buf);
-        const page_size = std.mem.readInt(u16, &buf, .big);
+        _ = try file.seekTo(100);
+        var page = Page.read(arena.allocator(), file.reader());
 
-        // read number of cells from page header
-        // page header starts at offset 100 for page 1
-        // number of cells is 2 bytes at offset 3 in page header
-        _ = try file.seekTo(100 + 3);
-        _ = try file.read(&buf);
-        const num_cells = std.mem.readInt(u16, &buf, .big);
+        for (page.cells) |cell| {
+            // try std.io.getStdOut().writer().print("Cell\n", .{});
+            try std.io.getStdOut().writer().print("{s} ", .{cell.payload.values[1].Text});
+        }
+        defer page.deinit();
+        try std.io.getStdOut().writer().print("\n", .{});
+    } else if (std.mem.eql(u8, command, ".dbinfo")) {
+        var file = try std.fs.cwd().openFile(database_file_path, .{});
+        defer file.close();
 
-        try std.io.getStdOut().writer().print("database page size: {}\n", .{page_size});
-        try std.io.getStdOut().writer().print("number of tables: {}\n", .{num_cells});
+        const dbInfo = try sqlite.DbInfo.read(file);
+        try std.io.getStdOut().writer().print("database page size: {}\n", .{dbInfo.page_size});
+        try std.io.getStdOut().writer().print("number of tables: {}\n", .{dbInfo.table_count});
     }
 }
