@@ -45,6 +45,5 @@ pub fn main() !void {
 
     // Handle SQL queries
     var db = try Database.init(allocator, file);
-    const result = try db.executeQuery(command);
-    try std.io.getStdOut().writer().print("{d}\n", .{result});
+    try db.executeQuery(command);
 }

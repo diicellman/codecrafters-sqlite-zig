@@ -8,7 +8,7 @@ pub const DbInfo = struct {
     table_count: u16,
 
     pub fn read(file: std.fs.File) !DbInfo {
-        // Read page size
+        // read page size
         var page_size_buf: [2]u8 = undefined;
         _ = try file.seekTo(16);
         _ = try file.read(&page_size_buf);
@@ -52,12 +52,17 @@ pub const Database = struct {
         return Page.read(self.allocator, self.file.reader());
     }
 
-    pub fn executeQuery(self: *Database, sql: []const u8) !usize {
+    pub fn executeQuery(self: *Database, sql: []const u8) !void {
         const query = try QueryParser.parseQuery(self.allocator, sql);
         defer switch (query) {
             .count => |c| self.allocator.free(c.table_name),
+            .select => |s| {
+                self.allocator.free(s.table_name);
+                self.allocator.free(s.column_name);
+            },
         };
 
+        // read schema page (always page 1)
         var schema_page = try self.readPage(1);
         defer schema_page.deinit();
 
@@ -66,10 +71,33 @@ pub const Database = struct {
                 const table_schema = Schema.findTable(schema_page, count_query.table_name) orelse
                     return error.TableNotFound;
 
+                // read the table's root page
                 var table_page = try self.readPage(table_schema.root_page);
                 defer table_page.deinit();
 
-                return table_page.cells.len;
+                const count = table_page.cells.len;
+                try std.io.getStdOut().writer().print("{d}\n", .{count});
+            },
+            .select => |select_query| {
+                const table_schema = Schema.findTable(schema_page, select_query.table_name) orelse
+                    return error.TableNotFound;
+
+                const column_index = try table_schema.findColumnIndex(select_query.column_name);
+
+                // read the table's root page
+                var table_page = try self.readPage(table_schema.root_page);
+                defer table_page.deinit();
+
+                // print each value in the column
+                for (table_page.cells) |cell| {
+                    if (column_index >= cell.payload.values.len) continue;
+
+                    switch (cell.payload.values[column_index]) {
+                        .Text => |text| try std.io.getStdOut().writer().print("{s}\n", .{text}),
+                        .Integer => |int| try std.io.getStdOut().writer().print("{d}\n", .{int}),
+                        .Null => try std.io.getStdOut().writer().print("NULL\n", .{}),
+                    }
+                }
             },
         }
     }
