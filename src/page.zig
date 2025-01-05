@@ -63,7 +63,7 @@ pub const Page = struct {
             }
         };
 
-        const Record = struct {
+        pub const Record = struct {
             pub const Value = union(enum) {
                 Null: void,
                 Text: []const u8,
@@ -72,7 +72,7 @@ pub const Page = struct {
             allocator: Allocator,
             values: []const Value,
 
-            fn read(allocator: Allocator, reader: Reader) Record {
+            pub fn read(allocator: Allocator, reader: Reader) Record {
                 const record_start = reader.context.getPos() catch undefined;
                 const record_header_size = Varint.read(reader.any());
 
@@ -135,17 +135,17 @@ pub const Page = struct {
                         },
                     };
 
-                    _ = values.append(value) catch undefined;
+                    values.append(value) catch unreachable;
                     values_pos = reader.context.getPos() catch undefined;
                 }
 
                 return .{
                     .allocator = allocator,
-                    .values = values.items,
+                    .values = values.toOwnedSlice() catch unreachable,
                 };
             }
 
-            fn deinit(self: *Record) void {
+            pub fn deinit(self: *Record) void {
                 for (self.values) |value| {
                     switch (value) {
                         .Text => self.allocator.free(value.Text),

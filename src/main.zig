@@ -1,6 +1,6 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
-const Page = sqlite.Page;
+const Database = sqlite.Database;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -18,28 +18,33 @@ pub fn main() !void {
     const database_file_path: []const u8 = args[1];
     const command: []const u8 = args[2];
 
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
+    var file = try std.fs.cwd().openFile(database_file_path, .{});
+    defer file.close();
+
+    if (std.mem.eql(u8, command, ".dbinfo")) {
+        const info = try sqlite.DbInfo.read(file);
+        const stdout = std.io.getStdOut().writer();
+        try stdout.print("database page size: {}\n", .{info.page_size});
+        try stdout.print("number of tables: {}\n", .{info.table_count});
+        return;
+    }
 
     if (std.mem.eql(u8, command, ".tables")) {
-        var file = try std.fs.cwd().openFile(database_file_path, .{});
-        defer file.close();
+        var db = try Database.init(allocator, file);
+        var schema_page = try db.readPage(1);
+        defer schema_page.deinit();
 
-        _ = try file.seekTo(100);
-        var page = Page.read(arena.allocator(), file.reader());
-
-        for (page.cells) |cell| {
-            // try std.io.getStdOut().writer().print("Cell\n", .{});
-            try std.io.getStdOut().writer().print("{s} ", .{cell.payload.values[1].Text});
+        for (schema_page.cells) |cell| {
+            if (cell.payload.values[0] == .Text and std.mem.eql(u8, cell.payload.values[0].Text, "table")) {
+                try std.io.getStdOut().writer().print("{s} ", .{cell.payload.values[2].Text});
+            }
         }
-        defer page.deinit();
         try std.io.getStdOut().writer().print("\n", .{});
-    } else if (std.mem.eql(u8, command, ".dbinfo")) {
-        var file = try std.fs.cwd().openFile(database_file_path, .{});
-        defer file.close();
-
-        const dbInfo = try sqlite.DbInfo.read(file);
-        try std.io.getStdOut().writer().print("database page size: {}\n", .{dbInfo.page_size});
-        try std.io.getStdOut().writer().print("number of tables: {}\n", .{dbInfo.table_count});
+        return;
     }
+
+    // Handle SQL queries
+    var db = try Database.init(allocator, file);
+    const result = try db.executeQuery(command);
+    try std.io.getStdOut().writer().print("{d}\n", .{result});
 }
