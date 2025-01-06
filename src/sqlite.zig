@@ -52,6 +52,19 @@ pub const Database = struct {
         return Page.read(self.allocator, self.file.reader());
     }
 
+    fn compareValues(value: Page.Cell.Record.Value, condition: QueryParser.Condition) bool {
+        if (!std.mem.eql(u8, condition.operator, "=")) return false;
+
+        switch (value) {
+            .Text => |text| return std.mem.eql(u8, text, condition.value),
+            .Integer => |int| {
+                const parsed = std.fmt.parseInt(i64, condition.value, 10) catch return false;
+                return int == parsed;
+            },
+            .Null => return false,
+        }
+    }
+
     fn printColumnValue(writer: anytype, value: Page.Cell.Record.Value) !void {
         switch (value) {
             .Text => |text| try writer.print("{s}", .{text}),
@@ -68,6 +81,11 @@ pub const Database = struct {
                 self.allocator.free(s.table_name);
                 for (s.columns) |col| self.allocator.free(col);
                 self.allocator.free(s.columns);
+                if (s.condition) |cond| {
+                    self.allocator.free(cond.column);
+                    self.allocator.free(cond.operator);
+                    self.allocator.free(cond.value);
+                }
             },
         };
 
@@ -82,7 +100,6 @@ pub const Database = struct {
                 const table_schema = Schema.findTable(schema_page, count_query.table_name) orelse
                     return error.TableNotFound;
 
-                // read the table's root page
                 var table_page = try self.readPage(table_schema.root_page);
                 defer table_page.deinit();
 
@@ -100,11 +117,29 @@ pub const Database = struct {
                     column_indices[i] = try table_schema.findColumnIndex(col);
                 }
 
-                // read the table's root page
+                // get where condition column index if needed
+                const where_col_idx = if (select_query.condition) |cond|
+                    try table_schema.findColumnIndex(cond.column)
+                else
+                    null;
+
                 var table_page = try self.readPage(table_schema.root_page);
                 defer table_page.deinit();
 
+                // print each matching row
                 for (table_page.cells) |cell| {
+                    // check WHERE condition if present
+                    if (select_query.condition) |cond| {
+                        if (where_col_idx) |idx| {
+                            if (idx >= cell.payload.values.len or
+                                !compareValues(cell.payload.values[idx], cond))
+                            {
+                                continue;
+                            }
+                        }
+                    }
+
+                    // print matching row
                     for (column_indices, 0..) |col_idx, i| {
                         if (i > 0) try stdout.print("|", .{});
                         if (col_idx >= cell.payload.values.len) continue;
