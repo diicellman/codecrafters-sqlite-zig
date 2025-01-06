@@ -52,19 +52,30 @@ pub const Database = struct {
         return Page.read(self.allocator, self.file.reader());
     }
 
+    fn printColumnValue(writer: anytype, value: Page.Cell.Record.Value) !void {
+        switch (value) {
+            .Text => |text| try writer.print("{s}", .{text}),
+            .Integer => |int| try writer.print("{d}", .{int}),
+            .Null => try writer.print("NULL", .{}),
+        }
+    }
+
     pub fn executeQuery(self: *Database, sql: []const u8) !void {
         const query = try QueryParser.parseQuery(self.allocator, sql);
         defer switch (query) {
             .count => |c| self.allocator.free(c.table_name),
             .select => |s| {
                 self.allocator.free(s.table_name);
-                self.allocator.free(s.column_name);
+                for (s.columns) |col| self.allocator.free(col);
+                self.allocator.free(s.columns);
             },
         };
 
         // read schema page (always page 1)
         var schema_page = try self.readPage(1);
         defer schema_page.deinit();
+
+        const stdout = std.io.getStdOut().writer();
 
         switch (query) {
             .count => |count_query| {
@@ -75,28 +86,31 @@ pub const Database = struct {
                 var table_page = try self.readPage(table_schema.root_page);
                 defer table_page.deinit();
 
-                const count = table_page.cells.len;
-                try std.io.getStdOut().writer().print("{d}\n", .{count});
+                try stdout.print("{d}\n", .{table_page.cells.len});
             },
             .select => |select_query| {
                 const table_schema = Schema.findTable(schema_page, select_query.table_name) orelse
                     return error.TableNotFound;
 
-                const column_index = try table_schema.findColumnIndex(select_query.column_name);
+                // get indices for all columns
+                var column_indices = try self.allocator.alloc(usize, select_query.columns.len);
+                defer self.allocator.free(column_indices);
+
+                for (select_query.columns, 0..) |col, i| {
+                    column_indices[i] = try table_schema.findColumnIndex(col);
+                }
 
                 // read the table's root page
                 var table_page = try self.readPage(table_schema.root_page);
                 defer table_page.deinit();
 
-                // print each value in the column
                 for (table_page.cells) |cell| {
-                    if (column_index >= cell.payload.values.len) continue;
-
-                    switch (cell.payload.values[column_index]) {
-                        .Text => |text| try std.io.getStdOut().writer().print("{s}\n", .{text}),
-                        .Integer => |int| try std.io.getStdOut().writer().print("{d}\n", .{int}),
-                        .Null => try std.io.getStdOut().writer().print("NULL\n", .{}),
+                    for (column_indices, 0..) |col_idx, i| {
+                        if (i > 0) try stdout.print("|", .{});
+                        if (col_idx >= cell.payload.values.len) continue;
+                        try printColumnValue(stdout, cell.payload.values[col_idx]);
                     }
+                    try stdout.print("\n", .{});
                 }
             },
         }
