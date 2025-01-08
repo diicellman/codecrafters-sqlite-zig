@@ -1,8 +1,17 @@
 const std = @import("std");
 
+pub const Op = enum {
+    Eq, // =
+    Ne, // != or <>
+    Lt, //
+    Le, // <=
+    Gt, // >
+    Ge, // >=
+};
+
 pub const Condition = struct {
     column: []const u8,
-    operator: []const u8,
+    operator: Op, // changed from []const u8 to Op
     value: []const u8,
 };
 
@@ -17,6 +26,17 @@ pub const Query = union(enum) {
     },
 };
 
+fn parseOperator(op_str: []const u8) !Op {
+    if (std.mem.eql(u8, op_str, "=")) return .Eq;
+    if (std.mem.eql(u8, op_str, "!=") or std.mem.eql(u8, op_str, "<>")) return .Ne;
+    if (std.mem.eql(u8, op_str, "<")) return .Lt;
+    if (std.mem.eql(u8, op_str, "<=")) return .Le;
+    if (std.mem.eql(u8, op_str, ">")) return .Gt;
+    if (std.mem.eql(u8, op_str, ">=")) return .Ge;
+
+    return error.InvalidOperator;
+}
+
 fn parseCondition(allocator: std.mem.Allocator, it: *std.mem.SplitIterator(u8, .sequence)) !?Condition {
     // look for WHERE keyword
     const where_word = it.next() orelse return null;
@@ -25,7 +45,7 @@ fn parseCondition(allocator: std.mem.Allocator, it: *std.mem.SplitIterator(u8, .
     }
 
     const column = it.next() orelse return error.InvalidQuery;
-    const operator = it.next() orelse return error.InvalidQuery;
+    const op_str = it.next() orelse return error.InvalidQuery;
     const value = it.next() orelse return error.InvalidQuery;
 
     // remove quotes from value if present
@@ -36,7 +56,7 @@ fn parseCondition(allocator: std.mem.Allocator, it: *std.mem.SplitIterator(u8, .
 
     return Condition{
         .column = try allocator.dupe(u8, column),
-        .operator = try allocator.dupe(u8, operator),
+        .operator = try parseOperator(op_str), // parse operator string into enum
         .value = try allocator.dupe(u8, clean_value),
     };
 }

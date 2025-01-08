@@ -44,6 +44,24 @@ pub const TableSchema = struct {
 
         return error.ColumnNotFound;
     }
+
+    pub fn isPrimaryKey(self: TableSchema, column_index: usize) bool {
+        const open_paren = std.mem.indexOf(u8, self.sql, "(") orelse return false;
+        const close_paren = std.mem.lastIndexOf(u8, self.sql, ")") orelse return false;
+        const columns_part = self.sql[open_paren + 1 .. close_paren];
+
+        var current_index: usize = 0;
+        var it = std.mem.splitSequence(u8, columns_part, ",");
+        while (it.next()) |col_def| {
+            if (current_index == column_index) {
+                const trimmed = std.mem.trim(u8, col_def, " \t\n\r");
+                return std.mem.containsAtLeast(u8, trimmed, 1, "PRIMARY KEY") or
+                    std.mem.containsAtLeast(u8, trimmed, 1, "primary key");
+            }
+            current_index += 1;
+        }
+        return false;
+    }
 };
 
 pub fn findTable(page: Page, table_name: []const u8) ?TableSchema {

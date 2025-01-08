@@ -52,20 +52,38 @@ pub const Database = struct {
         return Page.read(self.allocator, self.file.reader());
     }
 
-    fn compareValues(value: Page.Cell.Record.Value, condition: QueryParser.Condition) bool {
-        if (!std.mem.eql(u8, condition.operator, "=")) return false;
+    fn compareOrdering(ord: std.math.Order, op: QueryParser.Op) bool {
+        return switch (op) {
+            .Eq => ord == .eq,
+            .Ne => ord != .eq,
+            .Lt => ord == .lt,
+            .Le => ord == .lt or ord == .eq,
+            .Gt => ord == .gt,
+            .Ge => ord == .gt or ord == .eq,
+        };
+    }
 
+    fn compareValues(value: Page.Cell.Record.Value, condition: QueryParser.Condition) bool {
         switch (value) {
-            .Text => |text| return std.mem.eql(u8, text, condition.value),
+            .Text => |text| {
+                const ordering = std.mem.order(u8, text, condition.value);
+                return compareOrdering(ordering, condition.operator);
+            },
             .Integer => |int| {
                 const parsed = std.fmt.parseInt(i64, condition.value, 10) catch return false;
-                return int == parsed;
+                const ordering = std.math.order(int, parsed);
+                return compareOrdering(ordering, condition.operator);
             },
             .Null => return false,
         }
     }
 
-    fn printColumnValue(writer: anytype, value: Page.Cell.Record.Value) !void {
+    fn printColumnValue(writer: anytype, is_primary_key: bool, cell_row_id: u64, value: Page.Cell.Record.Value) !void {
+        if (is_primary_key) {
+            try writer.print("{d}", .{cell_row_id});
+            return;
+        }
+
         switch (value) {
             .Text => |text| try writer.print("{s}", .{text}),
             .Integer => |int| try writer.print("{d}", .{int}),
@@ -83,7 +101,7 @@ pub const Database = struct {
                 self.allocator.free(s.columns);
                 if (s.condition) |cond| {
                     self.allocator.free(cond.column);
-                    self.allocator.free(cond.operator);
+                    // self.allocator.free(cond.operator);
                     self.allocator.free(cond.value);
                 }
             },
@@ -142,8 +160,9 @@ pub const Database = struct {
                     // print matching row
                     for (column_indices, 0..) |col_idx, i| {
                         if (i > 0) try stdout.print("|", .{});
-                        if (col_idx >= cell.payload.values.len) continue;
-                        try printColumnValue(stdout, cell.payload.values[col_idx]);
+                        const is_primary_key = table_schema.isPrimaryKey(col_idx);
+                        if (col_idx >= cell.payload.values.len and !is_primary_key) continue;
+                        try printColumnValue(stdout, is_primary_key, cell.row_id, if (is_primary_key) .{ .Null = {} } else cell.payload.values[col_idx]);
                     }
                     try stdout.print("\n", .{});
                 }
