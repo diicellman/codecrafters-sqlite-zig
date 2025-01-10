@@ -1,6 +1,9 @@
 const std = @import("std");
-const sqlite = @import("sqlite.zig");
-const Database = sqlite.Database;
+const Record = @import("record.zig").Record;
+const Page = @import("page.zig").Page;
+const Schema = @import("schema.zig").Schema;
+const SQL = @import("sql_parser.zig");
+const Table = @import("table.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -16,34 +19,45 @@ pub fn main() !void {
     }
 
     const database_file_path: []const u8 = args[1];
-    const command: []const u8 = args[2];
+    const command: [:0]const u8 = args[2];
 
+    const stdout = std.io.getStdOut().writer();
     var file = try std.fs.cwd().openFile(database_file_path, .{});
     defer file.close();
 
     if (std.mem.eql(u8, command, ".dbinfo")) {
-        const info = try sqlite.DbInfo.read(file);
-        const stdout = std.io.getStdOut().writer();
-        try stdout.print("database page size: {}\n", .{info.page_size});
-        try stdout.print("number of tables: {}\n", .{info.table_count});
-        return;
-    }
+        var buf: [2]u8 = undefined;
+        try file.seekTo(16);
+        _ = try file.read(&buf);
+        const page_size = std.mem.readInt(u16, &buf, .big);
+        try stdout.print("database page size: {}\n", .{page_size});
 
-    if (std.mem.eql(u8, command, ".tables")) {
-        var db = try Database.init(allocator, file);
-        var schema_page = try db.readPage(1);
-        defer schema_page.deinit();
+        try file.seekTo(103);
+        _ = try file.read(&buf);
+        const num_tables = std.mem.readInt(u16, &buf, .big);
+        try stdout.print("number of tables: {}\n", .{num_tables});
+    } else if (std.mem.eql(u8, command, ".tables")) {
+        const reader = file.reader();
+        try reader.context.seekTo(16);
+        const page_size = try reader.readInt(u16, .big);
+        try reader.context.seekTo(0);
+        var page = try Page.init(allocator, reader, page_size);
+        defer page.deinit(allocator);
 
-        for (schema_page.cells) |cell| {
-            if (cell.payload.values[0] == .Text and std.mem.eql(u8, cell.payload.values[0].Text, "table")) {
-                try std.io.getStdOut().writer().print("{s} ", .{cell.payload.values[2].Text});
+        for (page.cells.tbl_leaf) |cell| {
+            const tbl_name_payload = cell.payload.payloads.items[2];
+            switch (tbl_name_payload) {
+                .Text => |v| {
+                    if (!std.mem.eql(u8, v, "sqlite_sequence")) {
+                        try stdout.print("{s} ", .{v});
+                    }
+                },
+                else => {},
             }
         }
-        try std.io.getStdOut().writer().print("\n", .{});
-        return;
+        try stdout.print("\n", .{});
+    } else {
+        const reader = file.reader();
+        try Table.query(allocator, reader, command);
     }
-
-    // Handle SQL queries
-    var db = try Database.init(allocator, file);
-    try db.executeQuery(command);
 }

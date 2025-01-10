@@ -1,90 +1,89 @@
 const std = @import("std");
 const Page = @import("page.zig").Page;
+const SQL = @import("sql_parser.zig");
 
-pub const TableSchema = struct {
-    root_page: usize,
-    sql: []const u8,
+pub const SchemaRow = struct {
+    tbl_name: [:0]const u8,
+    rootpage: isize,
+    sql: [:0]const u8,
+    statement: SQL.Statement,
+};
 
-    pub fn fromRecord(record: Page.Cell.Record) !TableSchema {
-        const root_page = switch (record.values[3]) {
-            .Integer => |v| @as(usize, @intCast(@as(u32, @intCast(v)))),
-            else => return error.InvalidSchemaFormat,
-        };
+const SchemaError = error{
+    InvalidPage,
+};
 
-        const sql = switch (record.values[4]) {
-            .Text => |t| t,
-            else => return error.InvalidSchemaFormat,
-        };
+pub const Schema = struct {
+    rows: []SchemaRow,
 
-        return TableSchema{
-            .root_page = root_page,
-            .sql = sql,
-        };
-    }
+    pub fn init(allocator: std.mem.Allocator, reader: std.fs.File.Reader, page_size: u64) !Schema {
+        try reader.context.seekTo(0);
+        var page = try Page.init(allocator, reader, page_size);
+        defer page.deinit(allocator);
 
-    pub fn findColumnIndex(self: TableSchema, column_name: []const u8) !usize {
-        const open_paren = std.mem.indexOf(u8, self.sql, "(") orelse return error.InvalidCreateTable;
-        const close_paren = std.mem.lastIndexOf(u8, self.sql, ")") orelse return error.InvalidCreateTable;
-
-        const columns_part = self.sql[open_paren + 1 .. close_paren];
-
-        var col_index: usize = 0;
-        var it = std.mem.splitSequence(u8, columns_part, ",");
-        while (it.next()) |col_def| {
-            const trimmed = std.mem.trim(u8, col_def, " \t\n\r");
-
-            var col_parts = std.mem.splitSequence(u8, trimmed, " ");
-            if (col_parts.next()) |col_name| {
-                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, col_name, " \t\n\r\""), column_name)) {
-                    return col_index;
-                }
+        var rows = try std.ArrayList(SchemaRow).initCapacity(allocator, page.cells.tbl_leaf.len);
+        errdefer {
+            for (rows.items) |row| {
+                allocator.free(row.tbl_name);
+                allocator.free(row.sql);
             }
-            col_index += 1;
+            rows.deinit();
         }
 
-        return error.ColumnNotFound;
+        for (page.cells.tbl_leaf) |cell| {
+            const record = cell.payload;
+            const tbl_name = switch (record.payloads.items[2]) {
+                .Text => |v| v,
+                else => return SchemaError.InvalidPage,
+            };
+            const rootpage = switch (record.payloads.items[3]) {
+                .Int => |v| v,
+                else => return SchemaError.InvalidPage,
+            };
+            const sql = switch (record.payloads.items[4]) {
+                .Text => |v| v,
+                else => return SchemaError.InvalidPage,
+            };
+            const duped = try allocator.dupeZ(u8, sql);
+            const row = SchemaRow{
+                .tbl_name = try allocator.dupeZ(u8, tbl_name),
+                .rootpage = rootpage,
+                .sql = duped,
+                .statement = try SQL.Statement.init(allocator, duped),
+            };
+            try rows.append(row);
+        }
+        return .{ .rows = try rows.toOwnedSlice() };
     }
 
-    pub fn isPrimaryKey(self: TableSchema, column_index: usize) bool {
-        const open_paren = std.mem.indexOf(u8, self.sql, "(") orelse return false;
-        const close_paren = std.mem.lastIndexOf(u8, self.sql, ")") orelse return false;
-        const columns_part = self.sql[open_paren + 1 .. close_paren];
-
-        var current_index: usize = 0;
-        var it = std.mem.splitSequence(u8, columns_part, ",");
-        while (it.next()) |col_def| {
-            if (current_index == column_index) {
-                const trimmed = std.mem.trim(u8, col_def, " \t\n\r");
-                return std.mem.containsAtLeast(u8, trimmed, 1, "PRIMARY KEY") or
-                    std.mem.containsAtLeast(u8, trimmed, 1, "primary key");
-            }
-            current_index += 1;
+    pub fn deinit(self: *Schema, allocator: std.mem.Allocator) void {
+        for (0..self.rows.len) |i| {
+            var row = self.rows[i];
+            allocator.free(row.tbl_name);
+            allocator.free(row.sql);
+            row.statement.deinit(allocator);
         }
-        return false;
+        allocator.free(self.rows);
+    }
+
+    pub fn debug(self: Schema) void {
+        for (self.rows) |row| {
+            std.debug.print("tbl_name: {s}, rootpage: {d}\n", .{ row.tbl_name, row.rootpage });
+            std.debug.print("sql: {s}\n", .{row.sql});
+            row.statement.debug();
+        }
     }
 };
 
-pub fn findTable(page: Page, table_name: []const u8) ?TableSchema {
-    for (page.cells) |cell| {
-        if (cell.payload.values.len < 5) continue;
-
-        const type_val = cell.payload.values[0];
-        const name_val = cell.payload.values[2];
-
-        const is_table = switch (type_val) {
-            .Text => |t| std.mem.eql(u8, t, "table"),
-            else => false,
-        };
-        if (!is_table) continue;
-
-        const matches = switch (name_val) {
-            .Text => |n| std.mem.eql(u8, n, table_name),
-            else => false,
-        };
-        if (!matches) continue;
-
-        return TableSchema.fromRecord(cell.payload) catch return null;
-    }
-
-    return null;
+test "read schema" {
+    var file = try std.fs.cwd().openFile("companies.db", .{});
+    defer file.close();
+    const allocator = std.testing.allocator;
+    const reader = file.reader();
+    try reader.context.seekTo(16);
+    const page_size = try reader.readInt(u16, .big);
+    var schema = try Schema.init(allocator, reader, page_size);
+    defer schema.deinit(allocator);
+    schema.debug();
+    std.debug.print("page size: {}\n", .{page_size});
 }

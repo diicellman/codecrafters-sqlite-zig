@@ -1,259 +1,262 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList(u16);
-const AnyReader = std.io.AnyReader;
-const Reader = std.fs.File.Reader;
+const Record = @import("record.zig").Record;
+const Varint = @import("varint.zig");
+
+pub const TableLeafCell = struct {
+    payload_size: u64,
+    key: u64, // rowid
+    payload: Record,
+    overflow_page_num: ?u32,
+
+    pub fn init(allocator: Allocator, reader: std.fs.File.Reader, page_size: u64) !TableLeafCell {
+        const payload_size = try Varint.parse(reader);
+        const rowid = try Varint.parse(reader);
+        const payload = try Record.init(allocator, reader);
+        const has_overflow = payload_size >= (page_size - 35);
+        const overflow_page_num = if (has_overflow) try reader.readInt(u32, .big) else null;
+        return .{
+            .payload_size = payload_size,
+            .key = rowid,
+            .payload = payload,
+            .overflow_page_num = overflow_page_num,
+        };
+    }
+
+    pub fn deinit(self: *TableLeafCell, allocator: Allocator) void {
+        self.payload.deinit(allocator);
+    }
+};
+
+pub const TableInteriorCell = struct {
+    left_page_num: u32,
+    key: u64,
+
+    pub fn init(reader: std.fs.File.Reader) !TableInteriorCell {
+        const left_page_num = try reader.readInt(u32, .big);
+        const key = try Varint.parse(reader);
+        return .{
+            .left_page_num = left_page_num,
+            .key = key,
+        };
+    }
+
+    pub fn debug(self: TableInteriorCell) void {
+        std.debug.print("left pointer: {}, key: {}\n", .{ self.left_page_num, self.key });
+    }
+};
+
+pub const IndexLeafCell = struct {
+    payload_size: u64,
+    payload: Record,
+    overflow_page_num: ?u32,
+
+    pub fn init(allocator: Allocator, reader: std.fs.File.Reader, page_size: u64) !IndexLeafCell {
+        const payload_size = try Varint.parse(reader);
+        const payload = try Record.init(allocator, reader);
+        const has_overflow = payload_size >= (page_size - 35);
+        const overflow_page_num = if (has_overflow) try reader.readInt(u32, .big) else null;
+        return .{
+            .payload_size = payload_size,
+            .payload = payload,
+            .overflow_page_num = overflow_page_num,
+        };
+    }
+
+    pub fn deinit(self: *IndexLeafCell, allocator: Allocator) void {
+        self.payload.deinit(allocator);
+    }
+};
+
+pub const IndexInteriorCell = struct {
+    left_page_num: u32,
+    payload_size: u64,
+    payload: Record,
+    overflow_page_num: ?u32,
+
+    pub fn init(allocator: Allocator, reader: std.fs.File.Reader, page_size: u64) !IndexInteriorCell {
+        const left_page_num = try reader.readInt(u32, .big);
+        const payload_size = try Varint.parse(reader);
+        const payload = try Record.init(allocator, reader);
+        const has_overflow = payload_size >= (page_size - 35);
+        const overflow_page_num = if (has_overflow) try reader.readInt(u32, .big) else null;
+        return .{
+            .left_page_num = left_page_num,
+            .payload_size = payload_size,
+            .payload = payload,
+            .overflow_page_num = overflow_page_num,
+        };
+    }
+
+    pub fn deinit(self: *IndexInteriorCell, allocator: Allocator) void {
+        self.payload.deinit(allocator);
+    }
+};
+
+const PageType = enum(u8) {
+    tbl_leaf = 0x0d,
+    tbl_interior = 0x05,
+    idx_leaf = 0x0a,
+    idx_interior = 0x02,
+};
+
+pub const Cells = union(PageType) {
+    tbl_leaf: []TableLeafCell,
+    tbl_interior: []TableInteriorCell,
+    idx_leaf: []IndexLeafCell,
+    idx_interior: []IndexInteriorCell,
+
+    pub fn init(
+        allocator: Allocator,
+        reader: std.fs.File.Reader,
+        page_type: PageType,
+        page_size: u64,
+        offsets: []u64,
+    ) !Cells {
+        const num_cells = offsets.len;
+        switch (page_type) {
+            .tbl_leaf => {
+                const cells = try allocator.alloc(TableLeafCell, num_cells);
+                errdefer allocator.free(cells);
+
+                for (offsets, 0..) |offset, i| {
+                    try reader.context.seekTo(offset);
+                    cells[i] = try TableLeafCell.init(allocator, reader, page_size);
+                }
+
+                return Cells{ .tbl_leaf = cells };
+            },
+            .tbl_interior => {
+                const cells = try allocator.alloc(TableInteriorCell, num_cells);
+                errdefer allocator.free(cells);
+
+                for (offsets, 0..) |offset, i| {
+                    try reader.context.seekTo(offset);
+                    cells[i] = try TableInteriorCell.init(reader);
+                }
+
+                return Cells{ .tbl_interior = cells };
+            },
+            .idx_leaf => {
+                const cells = try allocator.alloc(IndexLeafCell, num_cells);
+                errdefer allocator.free(cells);
+
+                for (offsets, 0..) |offset, i| {
+                    try reader.context.seekTo(offset);
+                    cells[i] = try IndexLeafCell.init(allocator, reader, page_size);
+                }
+
+                return Cells{ .idx_leaf = cells };
+            },
+            .idx_interior => {
+                const cells = try allocator.alloc(IndexInteriorCell, num_cells);
+                errdefer allocator.free(cells);
+
+                for (offsets, 0..) |offset, i| {
+                    try reader.context.seekTo(offset);
+                    cells[i] = try IndexInteriorCell.init(allocator, reader, page_size);
+                }
+
+                return Cells{ .idx_interior = cells };
+            },
+        }
+    }
+
+    pub fn deinit(self: *Cells, allocator: Allocator) void {
+        switch (self.*) {
+            .tbl_leaf => |cells| {
+                for (cells) |*cell| {
+                    cell.deinit(allocator);
+                }
+                allocator.free(cells);
+            },
+            .tbl_interior => |cells| {
+                allocator.free(cells);
+            },
+            .idx_leaf => |cells| {
+                for (cells) |*cell| {
+                    cell.deinit(allocator);
+                }
+                allocator.free(cells);
+            },
+            .idx_interior => |cells| {
+                for (cells) |*cell| {
+                    cell.deinit(allocator);
+                }
+                allocator.free(cells);
+            },
+        }
+    }
+};
 
 pub const Page = struct {
-    pub const Type = enum(u8) {
-        inter_index = 0x02,
-        inter_table = 0x05,
-        leaf_index = 0x0A,
-        leaf_table = 0x0D,
-    };
+    cells: Cells,
+    right_pointer: ?u32,
 
-    pub const Header = struct {
-        page_type: Type,
-        free_block_offset: u16,
-        cell_count: u16,
-        cell_content_offset: u16,
-        fragmented_free_bytes_count: u8,
-        right_most_pointer: ?u32,
+    pub fn init(allocator: Allocator, reader: std.fs.File.Reader, page_size: u64) !Page {
+        const start_pos = try reader.context.getPos();
+        const header_start_pos = if (start_pos == 0) 100 else start_pos;
 
-        pub fn read(reader: Reader) Header {
-            const page_type = reader.readEnum(Type, .big) catch undefined;
-            const free_block_offset = reader.readInt(u16, .big) catch undefined;
-            const cell_count = reader.readInt(u16, .big) catch undefined;
-            const cell_content_offset = reader.readInt(u16, .big) catch undefined;
-            const fragmented_free_bytes_count = reader.readInt(u8, .big) catch undefined;
-            var right_most_pointer: ?u32 = null;
+        try reader.context.seekTo(header_start_pos);
+        const page_type = try reader.readEnum(PageType, .big);
+        try reader.context.seekTo(header_start_pos + 3);
+        const num_cells = try reader.readInt(u16, .big);
 
-            if (page_type == .inter_index or page_type == .inter_table) {
-                right_most_pointer = reader.readInt(u32, .big) catch undefined;
-            }
+        var cell_pointers = try allocator.alloc(u64, num_cells);
+        defer allocator.free(cell_pointers);
 
-            return .{
-                .page_type = page_type,
-                .free_block_offset = free_block_offset,
-                .cell_count = cell_count,
-                .cell_content_offset = cell_content_offset,
-                .fragmented_free_bytes_count = fragmented_free_bytes_count,
-                .right_most_pointer = right_most_pointer,
-            };
-        }
-    };
+        try reader.context.seekTo(header_start_pos + 8);
+        var right_pointer: ?u32 = null;
 
-    pub const Cell = struct {
-        const Varint = struct {
-            const Byte = packed struct {
-                value: u7,
-                shift: u1,
-            };
-
-            fn read(reader: AnyReader) u64 {
-                var result: u64 = 0;
-                for (0..9) |_| {
-                    const byte: Byte = @bitCast(reader.readByte() catch undefined);
-                    result = (result << 7) | byte.value;
-                    if (byte.shift == 0) {
-                        break;
-                    }
-                }
-                return result;
-            }
-        };
-
-        pub const Record = struct {
-            pub const Value = union(enum) {
-                Null: void,
-                Text: []const u8,
-                Integer: isize,
-            };
-            allocator: Allocator,
-            values: []const Value,
-
-            pub fn read(allocator: Allocator, reader: Reader) Record {
-                const record_start = reader.context.getPos() catch undefined;
-                const record_header_size = Varint.read(reader.any());
-
-                if (record_header_size == 0) {
-                    return .{
-                        .allocator = allocator,
-                        .values = &[_]Value{},
-                    };
-                }
-
-                if (record_header_size > 1000) {
-                    return .{
-                        .allocator = allocator,
-
-                        .values = &[_]Value{},
-                    };
-                }
-
-                const types_start = reader.context.getPos() catch undefined;
-                const values_start = record_start + record_header_size;
-
-                var types_pos = types_start;
-                var values_pos = values_start;
-                var values = std.ArrayList(Value).init(allocator);
-
-                while (true) {
-                    if (types_pos == values_start) {
-                        break;
-                    }
-                    _ = reader.context.seekTo(types_pos) catch undefined;
-
-                    const serial_type = Varint.read(reader.any());
-
-                    types_pos = reader.context.getPos() catch undefined;
-                    _ = reader.context.seekTo(values_pos) catch undefined;
-
-                    const value: Value = switch (serial_type) {
-                        0 => .{ .Null = {} },
-                        1 => .{ .Integer = reader.readInt(i8, .big) catch undefined },
-                        2 => .{ .Integer = reader.readInt(i16, .big) catch undefined },
-                        3 => .{ .Integer = reader.readInt(i24, .big) catch undefined },
-                        4 => .{ .Integer = reader.readInt(i32, .big) catch undefined },
-                        5 => .{ .Integer = reader.readInt(i48, .big) catch undefined },
-                        6 => .{ .Integer = reader.readInt(i64, .big) catch undefined },
-                        7 => blk: {
-                            var bytes: [8]u8 = undefined;
-                            _ = reader.readAll(&bytes) catch undefined;
-                            break :blk .{ .Integer = @bitCast(reader.readInt(i64, .big) catch undefined) };
-                        },
-                        8 => .{ .Integer = 0 },
-                        9 => .{ .Integer = 1 },
-                        10...11 => .{ .Null = {} },
-                        else => blk: {
-                            const t: usize = if (serial_type & 1 == 1) 13 else 12;
-                            const s: usize = (serial_type - t) >> 1;
-                            var v = std.ArrayList(u8).initCapacity(allocator, s) catch undefined;
-                            _ = v.addManyAt(0, s) catch undefined;
-                            _ = reader.read(v.items) catch undefined;
-                            break :blk .{ .Text = v.items };
-                        },
-                    };
-
-                    values.append(value) catch unreachable;
-                    values_pos = reader.context.getPos() catch undefined;
-                }
-
-                return .{
-                    .allocator = allocator,
-                    .values = values.toOwnedSlice() catch unreachable,
-                };
-            }
-
-            pub fn deinit(self: *Record) void {
-                for (self.values) |value| {
-                    switch (value) {
-                        .Text => self.allocator.free(value.Text),
-                        else => {},
-                    }
-                }
-                self.allocator.free(self.values);
-                self.* = undefined;
-            }
-        };
-
-        allocator: Allocator,
-        payload_size: u64,
-        row_id: u64,
-        payload: Record,
-        left_child_page: ?u32,
-
-        pub fn TableLeafCell(allocator: Allocator, reader: Reader) Cell {
-            const payload_size = Varint.read(reader.any());
-            const row_id = Varint.read(reader.any());
-            const payload = Record.read(allocator, reader);
-            return .{
-                .allocator = allocator,
-                .payload_size = payload_size,
-                .row_id = row_id,
-                .payload = payload,
-                .left_child_page = null,
-            };
+        switch (page_type) {
+            .tbl_interior, .idx_interior => {
+                right_pointer = try reader.readInt(u32, .big);
+                try reader.context.seekTo(header_start_pos + 12);
+            },
+            else => {},
         }
 
-        pub fn TableInternalCell(allocator: Allocator, reader: Reader) Cell {
-            const left_child = reader.readInt(u32, .big) catch undefined;
-
-            const payload_size = Varint.read(reader.any());
-
-            const row_id = Varint.read(reader.any());
-
-            const payload = Record.read(allocator, reader);
-
-            return .{
-                .allocator = allocator,
-                .payload_size = payload_size,
-                .row_id = row_id,
-                .payload = payload,
-                .left_child_page = left_child,
-            };
+        for (0..cell_pointers.len) |i| {
+            cell_pointers[i] = start_pos + try reader.readInt(u16, .big);
         }
 
-        pub fn deinit(self: *Cell) void {
-            self.payload.deinit();
-            self.* = undefined;
-        }
-    };
-    allocator: Allocator,
-    header: Header,
-    cells: []const Cell,
-    right_most_pointer: ?u32,
+        const cells = try Cells.init(
+            allocator,
+            reader,
+            page_type,
+            page_size,
+            cell_pointers,
+        );
 
-    pub fn read(allocator: Allocator, reader: Reader) Page {
-        var page_start_pos = reader.context.getPos() catch undefined;
-
-        if (page_start_pos == 100) {
-            page_start_pos = 0;
-        }
-
-        const header = Header.read(reader);
-
-        const cell_offsets = readCellOffsets(allocator, reader, header.cell_count);
-        defer allocator.free(cell_offsets);
-
-        var cells = std.ArrayList(Cell).initCapacity(allocator, header.cell_count) catch undefined;
-
-        for (0..cell_offsets.len) |i| {
-            const offset = cell_offsets[i];
-            // std.debug.print("Reading cell {d} at offset {d}\n", .{ i, offset });
-
-            _ = reader.context.seekTo(page_start_pos + offset) catch undefined;
-            const cell = switch (header.page_type) {
-                .inter_table => Cell.TableInternalCell(allocator, reader),
-                .leaf_table => Cell.TableLeafCell(allocator, reader),
-                else => unreachable,
-            };
-            _ = cells.append(cell) catch undefined;
-        }
-
-        return .{
-            .allocator = allocator,
-            .header = header,
-            .cells = cells.items,
-            .right_most_pointer = header.right_most_pointer,
-        };
+        return Page{ .cells = cells, .right_pointer = right_pointer };
     }
 
-    pub fn deinit(self: *Page) void {
-        for (0..self.cells.len) |i| {
-            var cell = self.cells[i];
-            cell.deinit();
-        }
-        self.allocator.free(self.cells);
+    pub fn deinit(self: *Page, allocator: Allocator) void {
+        self.cells.deinit(allocator);
     }
-    fn readCellOffsets(allocator: Allocator, reader: Reader, count: u16) []const u16 {
-        var offsets = ArrayList.initCapacity(allocator, count) catch undefined;
-        var i: usize = 0;
-        while (i < count) {
-            const offset = reader.readInt(u16, .big) catch undefined;
-            _ = offsets.append(offset) catch undefined;
-            i += 1;
+
+    pub fn debug(self: Page) void {
+        switch (self.cells) {
+            .tbl_leaf => |cells| {
+                for (cells) |cell| {
+                    std.debug.print("{any}\n", .{cell});
+                }
+            },
+            .tbl_interior => |cells| {
+                for (cells) |cell| {
+                    std.debug.print("{any}\n", .{cell});
+                }
+            },
+            .idx_leaf => |cells| {
+                for (cells) |cell| {
+                    std.debug.print("{any}\n", .{cell});
+                }
+            },
+            .idx_interior => |cells| {
+                for (cells) |cell| {
+                    std.debug.print("{any}\n", .{cell});
+                }
+            },
         }
-        return offsets.items;
     }
 };
