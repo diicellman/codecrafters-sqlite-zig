@@ -94,7 +94,6 @@ pub fn query(
         .select => |v| v,
         else => return error.Invalid,
     };
-
     defer select.deinit(allocator);
 
     try reader.context.seekTo(16);
@@ -322,12 +321,15 @@ fn printTableLeafCells(cells: []const TableLeafCell, select: SQL.Select, columnM
                     switch (payload) {
                         .Text => |v| {
                             const should_include = switch (select.where.?.operator) {
-                                .Eq => std.mem.eql(u8, v, select.where.?.cond),
-                                .Ne => !std.mem.eql(u8, v, select.where.?.cond),
-                                .Lt => std.mem.lessThan(u8, v, select.where.?.cond),
-                                .Le => std.mem.lessThan(u8, v, select.where.?.cond) or std.mem.eql(u8, v, select.where.?.cond),
-                                .Gt => std.mem.lessThan(u8, select.where.?.cond, v),
-                                .Ge => std.mem.lessThan(u8, select.where.?.cond, v) or std.mem.eql(u8, v, select.where.?.cond),
+                                .Eq => blk: {
+                                    const equal = std.ascii.eqlIgnoreCase(v, select.where.?.cond);
+                                    break :blk equal;
+                                },
+                                .Ne => !std.ascii.eqlIgnoreCase(v, select.where.?.cond),
+                                .Lt => std.ascii.lessThanIgnoreCase(v, select.where.?.cond),
+                                .Le => std.ascii.lessThanIgnoreCase(v, select.where.?.cond) or std.ascii.eqlIgnoreCase(v, select.where.?.cond),
+                                .Gt => std.ascii.lessThanIgnoreCase(select.where.?.cond, v),
+                                .Ge => std.ascii.lessThanIgnoreCase(select.where.?.cond, v) or std.ascii.eqlIgnoreCase(v, select.where.?.cond),
                             };
                             if (!should_include) {
                                 continue :outer;
