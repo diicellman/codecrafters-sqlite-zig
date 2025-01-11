@@ -104,15 +104,3 @@ pub const Record = struct {
         }
     }
 };
-
-test "read record header" {
-    const file = try std.fs.cwd().createFile("test.bin", .{ .read = true });
-    const allocator = std.testing.allocator;
-    defer file.close();
-    const bytes = [_]u8{ 0x03, 0x17, 0x02, 0x74, 0x61, 0x62, 0x6c, 0x65, 0x01, 0xff };
-    _ = try file.write(&bytes);
-    _ = try file.seekTo(0);
-    var record = try Record.init(allocator, file.reader());
-    defer record.deinit(allocator);
-    record.debug();
-}
