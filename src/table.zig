@@ -65,6 +65,7 @@ fn findRowIdsWithIndex(
     index: SchemaRow,
     where: SQL.Where,
     page_size: u16,
+    limit: ?usize,
 ) !std.ArrayList(u64) {
     var columnMap = try makeColumnMap(allocator, index.statement);
     defer {
@@ -82,6 +83,7 @@ fn findRowIdsWithIndex(
         where,
         rootpage,
         page_size,
+        limit,
     );
 }
 
@@ -123,9 +125,11 @@ pub fn query(
             index.?,
             select.where.?,
             page_size,
+            select.limit,
         );
         defer rowIds.deinit();
 
+        var rows_processed: usize = 0;
         for (rowIds.items) |rowId| {
             try traverseCellsWithIndex(
                 allocator,
@@ -135,9 +139,11 @@ pub fn query(
                 rootpage,
                 page_size,
                 rowId,
+                &rows_processed,
             );
         }
     } else {
+        var rows_processed: usize = 0;
         try traverseCells(
             allocator,
             reader,
@@ -145,6 +151,7 @@ pub fn query(
             columnMap,
             rootpage,
             page_size,
+            &rows_processed,
         );
     }
 }
@@ -157,48 +164,61 @@ fn traverseCellsWithIndex(
     rootpage: u32,
     page_size: u32,
     rowId: u64,
+    rows_processed: *usize,
 ) !void {
     var pages_to_read = std.ArrayList(u32).init(allocator);
     defer pages_to_read.deinit();
     try pages_to_read.append(rootpage);
 
     while (pages_to_read.items.len > 0) {
+        // check limit before processing next page
+        if (select.limit) |limit| {
+            if (rows_processed.* >= limit) {
+                return;
+            }
+        }
+
         const page_num = pages_to_read.orderedRemove(0);
         try reader.context.seekTo(page_size * (page_num - 1));
         var page = try Page.init(allocator, reader, page_size);
         defer page.deinit(allocator);
 
         switch (page.cells) {
-            .tbl_leaf => |cells| try printTableLeafCells(cells, select, columnMap),
+            .tbl_leaf => |cells| {
+                try printTableLeafCells(cells, select, columnMap, rows_processed);
+            },
             .tbl_interior => |cells| {
-                var left_key: ?u64 = null;
-                var right_key: ?u64 = null;
-                try pages_to_read.append(page.right_pointer.?);
+                // only process interior nodes if we haven't hit limit
+                if (select.limit == null or rows_processed.* < select.limit.?) {
+                    var left_key: ?u64 = null;
+                    var right_key: ?u64 = null;
+                    try pages_to_read.append(page.right_pointer.?);
 
-                for (cells) |cell| {
-                    if (rowId > cell.key) {
-                        if (left_key == null or cell.key >= left_key.?) {
-                            left_key = cell.key;
-                        }
-                    } else if (rowId <= cell.key) {
-                        if (right_key == null or cell.key <= right_key.?) {
-                            right_key = cell.key;
+                    for (cells) |cell| {
+                        if (rowId > cell.key) {
+                            if (left_key == null or cell.key >= left_key.?) {
+                                left_key = cell.key;
+                            }
+                        } else if (rowId <= cell.key) {
+                            if (right_key == null or cell.key <= right_key.?) {
+                                right_key = cell.key;
+                            }
                         }
                     }
-                }
 
-                if (left_key == null and right_key == null) {
-                    continue;
-                }
-
-                for (cells) |cell| {
-                    if (left_key != null and cell.key < left_key.?) {
+                    if (left_key == null and right_key == null) {
                         continue;
                     }
-                    if (right_key != null and cell.key > right_key.?) {
-                        continue;
+
+                    for (cells) |cell| {
+                        if (left_key != null and cell.key < left_key.?) {
+                            continue;
+                        }
+                        if (right_key != null and cell.key > right_key.?) {
+                            continue;
+                        }
+                        try pages_to_read.insert(0, cell.left_page_num);
                     }
-                    try pages_to_read.insert(0, cell.left_page_num);
                 }
             },
             else => return error.NotImplemented,
@@ -213,22 +233,35 @@ fn traverseCells(
     columnMap: std.StringHashMap(usize),
     rootpage: u32,
     page_size: u32,
+    rows_processed: *usize,
 ) !void {
     var pages_to_read = std.ArrayList(u32).init(allocator);
     defer pages_to_read.deinit();
     try pages_to_read.append(rootpage);
 
     while (pages_to_read.items.len > 0) {
+        // check limit before processing next page
+        if (select.limit) |limit| {
+            if (rows_processed.* >= limit) {
+                return;
+            }
+        }
+
         const page_num = pages_to_read.orderedRemove(0);
         try reader.context.seekTo(page_size * (page_num - 1));
         var page = try Page.init(allocator, reader, page_size);
         defer page.deinit(allocator);
 
         switch (page.cells) {
-            .tbl_leaf => |cells| try printTableLeafCells(cells, select, columnMap),
+            .tbl_leaf => |cells| {
+                try printTableLeafCells(cells, select, columnMap, rows_processed);
+            },
             .tbl_interior => |cells| {
-                for (cells) |cell| {
-                    try pages_to_read.insert(0, cell.left_page_num);
+                // only add child pages if we haven't hit limit
+                if (select.limit == null or rows_processed.* < select.limit.?) {
+                    for (cells) |cell| {
+                        try pages_to_read.insert(0, cell.left_page_num);
+                    }
                 }
             },
             else => return error.NotImplemented,
@@ -242,6 +275,7 @@ fn traverseIndex(
     where: SQL.Where,
     rootpage: u32,
     page_size: u32,
+    limit: ?usize,
 ) !std.ArrayList(u64) {
     var pages_to_read = std.ArrayList(u32).init(allocator);
     defer pages_to_read.deinit();
@@ -250,6 +284,13 @@ fn traverseIndex(
     var rowIds = std.ArrayList(u64).init(allocator);
 
     while (pages_to_read.items.len > 0) {
+        // check if we've hit the limit before processing next page
+        if (limit) |lim| {
+            if (rowIds.items.len >= lim) {
+                break;
+            }
+        }
+
         const page_num = pages_to_read.orderedRemove(0);
         try reader.context.seekTo(page_size * (page_num - 1));
         var page = try Page.init(allocator, reader, page_size);
@@ -262,44 +303,64 @@ fn traverseIndex(
                     const rowid: u64 = @intCast(cell.payload.payloads.items[1].Int);
                     if (std.mem.eql(u8, text, where.cond)) {
                         try rowIds.append(rowid);
+                        // early return if limit reached
+                        if (limit) |lim| {
+                            if (rowIds.items.len >= lim) {
+                                return rowIds;
+                            }
+                        }
                     }
                 }
             },
             .idx_interior => |cells| {
-                var left_key = cells[0].payload.payloads.items[0];
-                var right_key = cells[cells.len - 1].payload.payloads.items[0];
+                // only process interior nodes if we need more rows
+                if (limit == null or rowIds.items.len < limit.?) {
+                    var left_key = cells[0].payload.payloads.items[0];
+                    var right_key = cells[cells.len - 1].payload.payloads.items[0];
 
-                for (cells) |cell| {
-                    const payload = cell.payload.payloads.items[0];
-                    switch (payload.compare(RecordPayload{ .Text = where.cond })) {
-                        .lt => {
-                            if (payload.compare(left_key) == .gt) {
-                                left_key = payload;
+                    for (cells) |cell| {
+                        const payload = cell.payload.payloads.items[0];
+                        const rowid: u64 = @intCast(cell.payload.payloads.items[1].Int);
+                        switch (payload.compare(RecordPayload{ .Text = where.cond })) {
+                            .lt => {
+                                if (payload.compare(left_key) == .gt) {
+                                    left_key = payload;
+                                }
+                            },
+                            .gt => {
+                                if (payload.compare(right_key) == .lt) {
+                                    right_key = payload;
+                                }
+                            },
+                            .eq => {
+                                try rowIds.append(rowid);
+                                if (limit) |lim| {
+                                    if (rowIds.items.len >= lim) {
+                                        return rowIds;
+                                    }
+                                }
+                            },
+                        }
+                    }
+
+                    // only add child pages if we haven't hit the limit
+                    if (limit == null or rowIds.items.len < limit.?) {
+                        for (cells) |cell| {
+                            const payload = cell.payload.payloads.items[0];
+                            if (payload.compare(left_key) == .lt) {
+                                continue;
                             }
-                        },
-                        .gt => {
-                            if (payload.compare(right_key) == .lt) {
-                                right_key = payload;
+                            if (payload.compare(right_key) == .gt) {
+                                continue;
                             }
-                        },
-                        .eq => continue,
-                    }
-                }
+                            try pages_to_read.insert(0, cell.left_page_num);
+                        }
 
-                for (cells) |cell| {
-                    const payload = cell.payload.payloads.items[0];
-                    const rowid: u64 = @intCast(cell.payload.payloads.items[1].Int);
-
-                    if (payload.compare(RecordPayload{ .Text = where.cond }) == .eq) {
-                        try rowIds.append(rowid);
+                        // add right-most pointer if present
+                        if (page.right_pointer) |right_ptr| {
+                            try pages_to_read.append(right_ptr);
+                        }
                     }
-                    if (payload.compare(left_key) == .lt) {
-                        continue;
-                    }
-                    if (payload.compare(right_key) == .gt) {
-                        continue;
-                    }
-                    try pages_to_read.insert(0, cell.left_page_num);
                 }
             },
             else => return error.NotImplemented,
@@ -308,36 +369,46 @@ fn traverseIndex(
     return rowIds;
 }
 
-fn printTableLeafCells(cells: []const TableLeafCell, select: SQL.Select, columnMap: std.StringHashMap(usize)) !void {
+fn printTableLeafCells(
+    cells: []const TableLeafCell,
+    select: SQL.Select,
+    columnMap: std.StringHashMap(usize),
+    rows_processed: *usize,
+) !void {
     const stdout = std.io.getStdOut().writer();
     outer: for (cells) |cell| {
-        if (select.where != null) {
+        // check if we've hit the limit
+        if (select.limit) |limit| {
+            if (rows_processed.* >= limit) {
+                return;
+            }
+        }
+
+        // handle WHERE clause filtering
+        if (select.where) |where_clause| {
             var it = columnMap.iterator();
             while (it.next()) |e| {
                 const column = e.key_ptr.*;
                 const index = e.value_ptr.*;
                 const payload = cell.payload.payloads.items[index];
-                if (std.mem.eql(u8, select.where.?.column, column)) {
+                if (std.mem.eql(u8, where_clause.column, column)) {
                     switch (payload) {
                         .Text => |v| {
-                            const should_include = switch (select.where.?.operator) {
-                                .Eq => blk: {
-                                    const equal = std.ascii.eqlIgnoreCase(v, select.where.?.cond);
-                                    break :blk equal;
-                                },
-                                .Ne => !std.ascii.eqlIgnoreCase(v, select.where.?.cond),
-                                .Lt => std.ascii.lessThanIgnoreCase(v, select.where.?.cond),
-                                .Le => std.ascii.lessThanIgnoreCase(v, select.where.?.cond) or std.ascii.eqlIgnoreCase(v, select.where.?.cond),
-                                .Gt => std.ascii.lessThanIgnoreCase(select.where.?.cond, v),
-                                .Ge => std.ascii.lessThanIgnoreCase(select.where.?.cond, v) or std.ascii.eqlIgnoreCase(v, select.where.?.cond),
+                            const should_include = switch (where_clause.operator) {
+                                .Eq => std.ascii.eqlIgnoreCase(v, where_clause.cond),
+                                .Ne => !std.ascii.eqlIgnoreCase(v, where_clause.cond),
+                                .Lt => std.ascii.lessThanIgnoreCase(v, where_clause.cond),
+                                .Le => std.ascii.lessThanIgnoreCase(v, where_clause.cond) or std.ascii.eqlIgnoreCase(v, where_clause.cond),
+                                .Gt => std.ascii.lessThanIgnoreCase(where_clause.cond, v),
+                                .Ge => std.ascii.lessThanIgnoreCase(where_clause.cond, v) or std.ascii.eqlIgnoreCase(v, where_clause.cond),
                             };
                             if (!should_include) {
                                 continue :outer;
                             }
                         },
                         .Int => |i| {
-                            const cond_int = std.fmt.parseInt(isize, select.where.?.cond, 10) catch continue :outer;
-                            const should_include = switch (select.where.?.operator) {
+                            const cond_int = std.fmt.parseInt(isize, where_clause.cond, 10) catch continue :outer;
+                            const should_include = switch (where_clause.operator) {
                                 .Eq => i == cond_int,
                                 .Ne => i != cond_int,
                                 .Lt => i < cond_int,
@@ -378,6 +449,8 @@ fn printTableLeafCells(cells: []const TableLeafCell, select: SQL.Select, columnM
             }
         }
         try stdout.print("\n", .{});
+
+        rows_processed.* += 1;
     }
 }
 

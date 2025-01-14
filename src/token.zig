@@ -14,11 +14,13 @@ pub const Tag = enum {
     kw_not,
     kw_exists,
     kw_on,
+    kw_limit,
     open_brackets,
     close_brackets,
     semicolon,
     comma,
     star,
+    numeric_literal,
     string_literal,
     equals, // =
     notequals, // !=
@@ -51,6 +53,7 @@ pub const Token = struct {
         .{ "NOT", .kw_not },
         .{ "EXISTS", .kw_exists },
         .{ "ON", .kw_on },
+        .{ "LIMIT", .kw_limit },
     });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {
@@ -66,6 +69,7 @@ pub const Tokenizer = struct {
         start,
         identifier,
         string_literal,
+        numeric_literal,
     };
 
     pub fn init(buffer: [:0]const u8) Tokenizer {
@@ -92,6 +96,10 @@ pub const Tokenizer = struct {
                     'a'...'z', 'A'...'Z', '_' => {
                         state = .identifier;
                         result.tag = .identifier;
+                    },
+                    '0'...'9' => {
+                        state = .numeric_literal;
+                        result.tag = .numeric_literal;
                     },
                     ' ', '\n', '\t', '"' => {
                         result.loc.start = self.index + 1;
@@ -208,6 +216,10 @@ pub const Tokenizer = struct {
                         return result;
                     },
                     else => {},
+                },
+                .numeric_literal => switch (c) {
+                    '0'...'9' => {},
+                    else => break,
                 },
             }
         }

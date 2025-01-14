@@ -78,34 +78,50 @@ pub const Statement = union(enum) {
 
         var tok_idx = try parser.expectToken(.identifier);
         const tbl_name = try allocator.dupeZ(u8, parser.getTokenValue(tok_idx));
+        errdefer allocator.free(tbl_name);
+
         const columns_owned = try columns.toOwnedSlice();
+        errdefer {
+            for (columns_owned) |column| {
+                allocator.free(column);
+            }
+            allocator.free(columns_owned);
+        }
 
-        _ = parser.getToken(.kw_where) orelse return Select{
-            .tbl_name = tbl_name,
-            .columns = columns_owned,
-            .where = null,
-        };
+        var limit: ?usize = null;
+        var where: ?Where = null;
+        errdefer if (where) |*w| w.deinit(allocator);
 
-        tok_idx = try parser.expectToken(.identifier);
-        const where_column = parser.getTokenValue(tok_idx);
+        if (parser.getToken(.kw_where)) |_| {
+            tok_idx = try parser.expectToken(.identifier);
+            const where_column = parser.getTokenValue(tok_idx);
 
-        const op_token = parser.tokens[parser.tok_idx].tag;
-        const op = try getOperator(op_token);
-        _ = parser.advance();
+            const op_token = parser.tokens[parser.tok_idx].tag;
+            const op = try getOperator(op_token);
+            _ = parser.advance();
 
-        tok_idx = try parser.expectToken(.string_literal);
-        const where_cond = parser.getTokenValue(tok_idx);
+            tok_idx = try parser.expectToken(.string_literal);
+            const where_cond = parser.getTokenValue(tok_idx);
 
-        const where = Where{
-            .column = try allocator.dupeZ(u8, where_column),
-            .operator = op,
-            .cond = try allocator.dupeZ(u8, where_cond),
-        };
+            where = Where{
+                .column = try allocator.dupeZ(u8, where_column),
+                .operator = op,
+                .cond = try allocator.dupeZ(u8, where_cond),
+            };
+        }
+
+        // parse LIMIT after WHERE if present
+        if (parser.getToken(.kw_limit)) |_| {
+            tok_idx = try parser.expectToken(.numeric_literal);
+            const limit_str = parser.getTokenValue(tok_idx);
+            limit = try std.fmt.parseInt(usize, limit_str, 10);
+        }
 
         return Select{
             .tbl_name = tbl_name,
             .columns = columns_owned,
             .where = where,
+            .limit = limit,
         };
     }
 
@@ -210,6 +226,7 @@ pub const Select = struct {
     tbl_name: [:0]const u8,
     columns: [][:0]const u8,
     where: ?Where,
+    limit: ?usize = null,
 
     pub fn deinit(self: *Select, allocator: std.mem.Allocator) void {
         allocator.free(self.tbl_name);
